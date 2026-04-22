@@ -784,7 +784,177 @@ def start_proxy():
     raise RuntimeError(f"proxy not ready: {last}")
 
 
-def exec_claude(model: str):
+def _mru_path() -> str:
+    return os.path.join(CONFIG_DIR, "recent_projects.json")
+
+
+def _load_mru() -> list[str]:
+    try:
+        with open(_mru_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [p for p in data if isinstance(p, str) and os.path.isdir(p)]
+    except Exception:
+        return []
+
+
+def _save_mru(path: str):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        items = _load_mru()
+        path = os.path.abspath(path)
+        items = [p for p in items if p != path]
+        items.insert(0, path)
+        items = items[:10]
+        with open(_mru_path(), "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _find_git_root(start: str) -> str | None:
+    cur = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(cur, ".git")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
+def _looks_like_project(d: str) -> bool:
+    """任何下列特征命中即认为是项目根。"""
+    if os.path.isdir(os.path.join(d, ".git")):
+        return True
+    markers = (
+        "package.json", "pyproject.toml", "requirements.txt", "Cargo.toml",
+        "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
+        "Gemfile", "composer.json", "CMakeLists.txt", "Makefile",
+        ".claude", "CLAUDE.md", "README.md",
+    )
+    return any(os.path.exists(os.path.join(d, m)) for m in markers)
+
+
+def _auto_detect_project(cwd: str) -> str | None:
+    """
+    优先级:
+    1) cwd 本身是项目根
+    2) cwd 在某个 git 仓库里 → 取 git root
+    3) cwd 有项目特征 → 用 cwd
+    否则返回 None。
+    """
+    cwd = os.path.abspath(cwd)
+    root = _find_git_root(cwd)
+    if root:
+        return root
+    if _looks_like_project(cwd):
+        return cwd
+    return None
+
+
+def _resolve_project_dir(cli_dir: str | None) -> str:
+    """智能确定项目目录:CLI 参数 > 自动检测 cwd > 交互选择 MRU。"""
+    if cli_dir:
+        p = os.path.abspath(os.path.expanduser(cli_dir))
+        if not os.path.isdir(p):
+            print(red(f"  ! 目录不存在: {p}"))
+            sys.exit(1)
+        return p
+
+    cwd = os.getcwd()
+    # 若从 $HOME 或 / 启动,视作"无上下文",进入交互
+    sentinel = cwd in (os.path.expanduser("~"), "/", "/root")
+    auto = None if sentinel else _auto_detect_project(cwd)
+    if auto:
+        print(green("  ✓ 自动检测到项目: ") + bold(auto))
+        return auto
+
+    # 交互:展示 MRU + 手输
+    mru = _load_mru()
+    print(dim("\n  未检测到项目上下文,请选择或输入目录:"))
+    for i, p in enumerate(mru, 1):
+        tag = dim(" (git)") if os.path.isdir(os.path.join(p, ".git")) else ""
+        print(f"    {i}) {p}{tag}")
+    print(f"    N) 新目录路径")
+    print(f"    .) 使用当前 cwd ({cwd})")
+    try:
+        raw = input("  选择: ").strip()
+    except EOFError:
+        raw = "."
+    if raw == "." or raw == "":
+        return cwd
+    if raw.isdigit() and 1 <= int(raw) <= len(mru):
+        return mru[int(raw) - 1]
+    # 作为路径
+    p = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.isdir(p):
+        try:
+            os.makedirs(p, exist_ok=True)
+            print(green(f"  ✓ 已创建目录: {p}"))
+        except Exception as e:
+            print(red(f"  ! 创建目录失败: {e}"))
+            sys.exit(1)
+    return p
+
+
+def _ensure_git_repo(project_dir: str):
+    """确保目录是 git 仓库;若不是则 init + 初次提交,便于 worktree/diff 类 hook 立即工作。"""
+    if os.path.isdir(os.path.join(project_dir, ".git")):
+        return
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=project_dir, check=False)
+        # 基础 .gitignore(若不存在)
+        gi = os.path.join(project_dir, ".gitignore")
+        if not os.path.exists(gi):
+            with open(gi, "w", encoding="utf-8") as f:
+                f.write("node_modules/\n__pycache__/\n*.pyc\n.venv/\nvenv/\n"
+                        "dist/\nbuild/\n.DS_Store\n.env\n.env.local\n"
+                        ".claude/cache/\n")
+        subprocess.run(["git", "add", "-A"], cwd=project_dir, check=False)
+        subprocess.run(
+            ["git", "-c", "user.email=claude@local",
+             "-c", "user.name=claude",
+             "commit", "-q", "--allow-empty", "-m", "chore: init by claude-launch"],
+            cwd=project_dir, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(green("  ✓ git init 完成 ") + dim("(baseline commit)"))
+    except Exception as e:
+        print(red(f"  ! git init 失败: {e}"))
+
+
+def _ensure_git_identity(project_dir: str):
+    """若该仓库未设 user.email/name,设个本地默认,避免 commit/worktree hook 报错。"""
+    try:
+        for key, default in (("user.email", "claude@local"), ("user.name", "claude")):
+            r = subprocess.run(["git", "config", "--get", key],
+                               cwd=project_dir, capture_output=True, text=True)
+            if not r.stdout.strip():
+                subprocess.run(["git", "config", key, default], cwd=project_dir, check=False)
+    except Exception:
+        pass
+
+
+def _ensure_claude_mem_worker():
+    """确保 claude-mem worker 在运行(忽略失败)。"""
+    try:
+        r = subprocess.run(["npx", "claude-mem", "status"],
+                           capture_output=True, text=True, timeout=5)
+        if "running" in (r.stdout + r.stderr).lower():
+            return
+    except Exception:
+        pass
+    try:
+        subprocess.Popen(
+            ["npx", "claude-mem", "start"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid,
+        )
+        print(dim("  · claude-mem worker 已后台启动"))
+    except Exception:
+        pass
+
+
+def exec_claude(model: str, project_dir: str | None = None):
     settings_arg = json.dumps(
         _build_claude_settings(model),
         ensure_ascii=False, separators=(",", ":"))
@@ -796,6 +966,17 @@ def exec_claude(model: str):
         "ANTHROPIC_MODEL": model,
         "ANTHROPIC_CUSTOM_MODEL_OPTION": model,
     })
+    project_dir = _resolve_project_dir(project_dir)
+    try:
+        os.chdir(project_dir)
+        print(green("  ✓ cwd = ") + bold(project_dir))
+    except OSError as e:
+        print(red(f"  ! chdir 失败: {e}"))
+        sys.exit(1)
+    _ensure_git_repo(project_dir)
+    _ensure_git_identity(project_dir)
+    _ensure_claude_mem_worker()
+    _save_mru(project_dir)
     os.execvpe("claude", ["claude", "--settings", settings_arg], env)
 
 
@@ -809,7 +990,7 @@ def cmd_list():
             print(f"  - {m}")
 
 
-def cmd_menu():
+def cmd_menu(cli_dir: str | None = None):
     while True:
         providers = load_providers()
         clear_screen()
@@ -845,7 +1026,7 @@ def cmd_menu():
             sys.exit(1)
         print(dim("  · 启动 Claude Code  (model = ") + bold(model) + dim(")"))
         print()
-        exec_claude(model)
+        exec_claude(model, cli_dir)
 
 
 def main():
@@ -853,6 +1034,7 @@ def main():
     ap.add_argument("--proxy",  action="store_true", help="run as reverse proxy")
     ap.add_argument("--list",   action="store_true", help="list providers/models")
     ap.add_argument("--manage", action="store_true", help="jump into manager")
+    ap.add_argument("--cwd", "-C", help="project directory to launch Claude in")
     args = ap.parse_args()
 
     if args.proxy:
@@ -862,7 +1044,7 @@ def main():
     elif args.manage:
         manage_loop(load_providers())
     else:
-        cmd_menu()
+        cmd_menu(args.cwd)
 
 
 if __name__ == "__main__":
