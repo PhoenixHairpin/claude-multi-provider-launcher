@@ -112,6 +112,7 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+
     def _send_json(self, status, payload):
         body = json.dumps(payload).encode()
         self.send_response(status)
@@ -145,24 +146,43 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
         req.add_header("User-Agent", "Claude-Code/2.1.114")
 
         try:
-            resp = urllib.request.urlopen(req, timeout=180)
-            body = resp.read()
-            self.send_response(resp.status)
-            self.send_header("Content-Type",
-                             resp.headers.get("Content-Type", "application/json"))
-            self.end_headers()
-            self.wfile.write(body)
+            resp = urllib.request.urlopen(req, timeout=600)
+            self._stream_response(resp)
         except urllib.error.HTTPError as e:
-            body = e.read()
-            self.send_response(e.code)
-            self.send_header("Content-Type",
-                             e.headers.get("Content-Type", "application/json"))
-            self.end_headers()
-            self.wfile.write(body or json.dumps({"type": "error", "error": {
-                "type": "api_error", "message": str(e)}}).encode())
+            self._stream_response(e, is_error=True)
         except Exception as e:
             self._send_json(500, {"type": "error", "error": {
                 "type": "api_error", "message": str(e)}})
+
+    def _stream_response(self, resp, is_error=False):
+        """Relay upstream headers + body as a stream, so SSE / chunked keeps flowing."""
+        status = resp.code if is_error else resp.status
+        self.send_response(status)
+        # forward relevant headers but avoid hop-by-hop
+        skip = {"connection", "keep-alive", "proxy-authenticate",
+                "proxy-authorization", "te", "trailers",
+                "transfer-encoding", "upgrade", "content-length"}
+        for k, v in resp.headers.items():
+            if k.lower() in skip:
+                continue
+            self.send_header(k, v)
+        # let Python's HTTP server add its own framing; we stream with chunked
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            while True:
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                self.wfile.write(f"{len(chunk):x}\r\n".encode())
+                self.wfile.write(chunk)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+            # terminating zero-length chunk
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_GET(self):
         if self.path.split("?", 1)[0] != "/v1/models":
@@ -180,7 +200,8 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
 def run_proxy():
     _ProxyHandler.model_index = build_model_index(load_providers())
     socketserver.TCPServer.allow_reuse_address = True
-    srv = http.server.HTTPServer((PROXY_HOST, PROXY_PORT), _ProxyHandler)
+    srv = http.server.ThreadingHTTPServer((PROXY_HOST, PROXY_PORT), _ProxyHandler)
+    srv.daemon_threads = True
     sys.stderr.write(f"Proxy on {PROXY_HOST}:{PROXY_PORT} "
                      f"({len(_ProxyHandler.model_index)} models)\n")
     sys.stderr.flush()

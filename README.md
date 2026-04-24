@@ -80,6 +80,13 @@ python3 claude-launch.py
 2. `{base_url}/models`
 3. 如果 `base_url` 以 `/anthropic` 结尾,还会去掉后缀再试 `.../v1/models` 和 `.../models`
 
+## 性能 / 并发
+
+- 反代基于 `ThreadingHTTPServer`,每个请求独立线程,**无并发上限**(受系统 fd/线程数制约,通常几百路无压力)。
+- 响应以 4KB 分块流式转发(HTTP chunked),SSE / 长回答**边生成边显示**,不会整段读完再吐给 Claude Code。
+- 真正的瓶颈通常在上游供应商的单 key 并发 / QPS,而不是代理本身。
+
+
 ## 工作原理
 
 ```
