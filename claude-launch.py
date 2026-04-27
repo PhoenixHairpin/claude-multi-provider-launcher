@@ -830,7 +830,7 @@ def _load_base_settings() -> dict:
         sys.exit(1)
 
 
-def _build_claude_settings(model: str) -> dict:
+def _build_claude_settings(model: str, small_model: str | None = None) -> dict:
     s = copy.deepcopy(_load_base_settings())
     env = dict(s.get("env") or {})
     env.update({
@@ -840,8 +840,16 @@ def _build_claude_settings(model: str) -> dict:
         "ANTHROPIC_MODEL": model,
         "ANTHROPIC_CUSTOM_MODEL_OPTION": model,
     })
+    if small_model:
+        # Used by Claude Code for cheap/fast subagent + background work.
+        # The proxy routes by request body.model, so a small model from a
+        # different provider (different base_url + api_key) works as long as
+        # its id is in the model_index.
+        env["ANTHROPIC_SMALL_FAST_MODEL"] = small_model
     s["env"] = env
     s["model"] = model
+    if small_model:
+        s["smallFastModel"] = small_model
     return s
 
 
@@ -1037,9 +1045,10 @@ def _ensure_claude_mem_worker():
         pass
 
 
-def exec_claude(model: str, project_dir: str | None = None):
+def exec_claude(model: str, project_dir: str | None = None,
+                small_model: str | None = None):
     settings_arg = json.dumps(
-        _build_claude_settings(model),
+        _build_claude_settings(model, small_model),
         ensure_ascii=False, separators=(",", ":"))
     env = os.environ.copy()
     env.update({
@@ -1049,6 +1058,8 @@ def exec_claude(model: str, project_dir: str | None = None):
         "ANTHROPIC_MODEL": model,
         "ANTHROPIC_CUSTOM_MODEL_OPTION": model,
     })
+    if small_model:
+        env["ANTHROPIC_SMALL_FAST_MODEL"] = small_model
     project_dir = _resolve_project_dir(project_dir)
     try:
         os.chdir(project_dir)
@@ -1071,6 +1082,53 @@ def cmd_list():
         print(f"[{p['label']}]  {p['base_url']}")
         for m in p["models"]:
             print(f"  - {m}")
+
+
+def _pick_small_model(providers: list[dict], main_model: str) -> str | None:
+    """Ask the user to pick a small/fast model for subagents + background work.
+
+    Returns:
+      - None if user skips (subagents will then inherit the main model).
+      - a model id present in build_model_index() — possibly from a different
+        provider than the main model.
+    """
+    items = flat_models(providers)
+    if not items:
+        return None
+    print()
+    lines: list[str] = []
+    last = None
+    for i, (model, prov) in enumerate(items, 1):
+        if prov is not last:
+            if last is not None:
+                lines.append("")
+            lines.append("  " + c(prov["color"] + ";1", "▎ " + prov["label"]))
+            last = prov
+        marker = green(" ★") if model == main_model else "  "
+        num = c("1;32", f"{i:>2})")
+        lines.append(f"   {marker}{num}  {bold(model)}  " + dim(prov["base_url"]))
+    lines.append("__SEP__")
+    lines.append("   " + c("1;33", " 0)") + "  跳过 (subagent 沿用主模型)")
+    render_box(
+        lines, width=70,
+        title="选择 small/fast 模型 (subagent + 后台任务)",
+        subtitle=f"主模型: {main_model}  ·  ★ 标记为同模型",
+    )
+    print()
+    v = prompt("请选择 (回车 = 跳过)", "0").strip()
+    if v in ("", "0", "q", "Q"):
+        return None
+    try:
+        idx = int(v) - 1
+    except ValueError:
+        print(red("  请输入数字, 已跳过"))
+        pause()
+        return None
+    if not (0 <= idx < len(items)):
+        print(red("  无效编号, 已跳过"))
+        pause()
+        return None
+    return items[idx][0]
 
 
 def cmd_menu(cli_dir: str | None = None):
@@ -1099,6 +1157,11 @@ def cmd_menu(cli_dir: str | None = None):
             continue
 
         model = items[idx][0]
+        # Two-tier model selection: main model first, then optional small/fast
+        # model for subagents + background work. The proxy's model_index maps
+        # model id -> (base_url, api_key), so the small model can be served by
+        # a completely different provider than the main one.
+        small_model = _pick_small_model(providers, model)
         print()
         print(dim("  · 启动本地代理 ..."))
         try:
@@ -1107,9 +1170,13 @@ def cmd_menu(cli_dir: str | None = None):
         except Exception as e:
             print(red(f"  ✗ proxy 启动失败: {e}"))
             sys.exit(1)
-        print(dim("  · 启动 Claude Code  (model = ") + bold(model) + dim(")"))
+        if small_model:
+            print(dim("  · 启动 Claude Code  (model = ") + bold(model)
+                  + dim(", small = ") + bold(small_model) + dim(")"))
+        else:
+            print(dim("  · 启动 Claude Code  (model = ") + bold(model) + dim(")"))
         print()
-        exec_claude(model, cli_dir)
+        exec_claude(model, cli_dir, small_model=small_model)
 
 
 def main():
