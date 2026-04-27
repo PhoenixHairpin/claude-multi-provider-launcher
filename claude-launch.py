@@ -155,34 +155,96 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "type": "api_error", "message": str(e)}})
 
     def _stream_response(self, resp, is_error=False):
-        """Relay upstream headers + body as a stream, so SSE / chunked keeps flowing."""
-        status = resp.code if is_error else resp.status
-        self.send_response(status)
-        # forward relevant headers but avoid hop-by-hop
-        skip = {"connection", "keep-alive", "proxy-authenticate",
-                "proxy-authorization", "te", "trailers",
-                "transfer-encoding", "upgrade", "content-length"}
-        for k, v in resp.headers.items():
-            if k.lower() in skip:
-                continue
-            self.send_header(k, v)
-        # let Python's HTTP server add its own framing; we stream with chunked
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
+        """Relay upstream headers + body as a stream, so SSE / chunked keeps flowing.
+
+        Bug fix: previously only BrokenPipeError/ConnectionResetError were caught,
+        so an upstream timeout/SSL EOF/IncompleteRead during `resp.read()` would
+        bubble out *after* the 200 chunked headers had been sent — leaving the
+        client (Claude Code CLI) with a stream that ends without the zero-length
+        terminator. The CLI then writes a partial assistant block to its
+        transcript jsonl (no stop_reason, truncated message.id), and *every
+        subsequent request in that session* fails with the synthetic
+        "API Error: Content block not found" because the transcript no longer
+        validates.
+
+        Now: any exception from upstream after headers are sent is converted to
+        an SSE `event: error` block followed by a proper zero-length chunk, so
+        the CLI sees a *complete* (but failed) round-trip and does not poison
+        the transcript.
+        """
+        headers_sent = False
         try:
+            status = resp.code if is_error else resp.status
+            self.send_response(status)
+            # forward relevant headers but avoid hop-by-hop
+            skip = {"connection", "keep-alive", "proxy-authenticate",
+                    "proxy-authorization", "te", "trailers",
+                    "transfer-encoding", "upgrade", "content-length"}
+            for k, v in resp.headers.items():
+                if k.lower() in skip:
+                    continue
+                self.send_header(k, v)
+            # let Python's HTTP server add its own framing; we stream with chunked
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            headers_sent = True
+
             while True:
-                chunk = resp.read(4096)
+                try:
+                    chunk = resp.read(4096)
+                except (BrokenPipeError, ConnectionResetError):
+                    # downstream (CLI) went away — nothing useful to do
+                    return
+                except Exception as upstream_err:
+                    # Upstream stream broke mid-flight (timeout / SSL EOF /
+                    # IncompleteRead / DNS / etc). Emit an SSE error event so
+                    # the CLI treats the turn as a clean failure instead of a
+                    # half-written assistant message.
+                    err_payload = json.dumps({
+                        "type": "error",
+                        "error": {
+                            "type": "overloaded_error",
+                            "message": f"upstream stream broken: {upstream_err!r}",
+                        },
+                    })
+                    err_evt = (
+                        f"event: error\ndata: {err_payload}\n\n"
+                    ).encode()
+                    try:
+                        self.wfile.write(f"{len(err_evt):x}\r\n".encode())
+                        self.wfile.write(err_evt)
+                        self.wfile.write(b"\r\n")
+                    except Exception:
+                        pass
+                    break
                 if not chunk:
                     break
-                self.wfile.write(f"{len(chunk):x}\r\n".encode())
-                self.wfile.write(chunk)
-                self.wfile.write(b"\r\n")
+                try:
+                    self.wfile.write(f"{len(chunk):x}\r\n".encode())
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
+            # ALWAYS write the zero-length terminator so the client sees a
+            # well-formed end-of-stream.
+            try:
+                self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
-            # terminating zero-length chunk
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except Exception as e:
+            # Headers not sent yet — we can still return a clean JSON error.
+            if not headers_sent:
+                try:
+                    self._send_json(502, {"type": "error", "error": {
+                        "type": "api_error", "message": str(e)}})
+                except Exception:
+                    pass
 
     def do_GET(self):
         if self.path.split("?", 1)[0] != "/v1/models":
