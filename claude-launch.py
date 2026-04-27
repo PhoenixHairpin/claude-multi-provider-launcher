@@ -841,15 +841,15 @@ def _build_claude_settings(model: str, small_model: str | None = None) -> dict:
         "ANTHROPIC_CUSTOM_MODEL_OPTION": model,
     })
     if small_model:
-        # Used by Claude Code for cheap/fast subagent + background work.
-        # The proxy routes by request body.model, so a small model from a
-        # different provider (different base_url + api_key) works as long as
-        # its id is in the model_index.
+        # Verified against Claude Code v2.1.120 binary: the CLI reads
+        # `ANTHROPIC_SMALL_FAST_MODEL` for cheap subagent + background work.
+        # There is NO equivalent settings.json key — the only model-family
+        # settings keys the binary recognises are `pinHaiku`/`pinSonnet`/
+        # `pinOpus` (which map to ANTHROPIC_DEFAULT_*_MODEL and have a
+        # different meaning). So we configure via env only.
         env["ANTHROPIC_SMALL_FAST_MODEL"] = small_model
     s["env"] = env
     s["model"] = model
-    if small_model:
-        s["smallFastModel"] = small_model
     return s
 
 
